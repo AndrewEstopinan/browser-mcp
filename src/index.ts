@@ -13,6 +13,7 @@
  *   web_scraper_trigger        - trigger a Crawl / Web Scraper dataset job
  *   web_scraper_get_results    - poll & download dataset results
  *   browser_scrape             - cloud browser automation w/ auto CAPTCHA solving
+ *   web_data_*                 - 35 structured vertical dataset tools
  *
  * Transport: stdio (the standard MCP transport for local servers).
  */
@@ -25,8 +26,9 @@ import { loadConfig } from "./config.js";
 import { BrightDataClient, BrightDataApiError } from "./client.js";
 import { buildSearchUrl } from "./serp.js";
 import { runBrowserTask, type BrowserAction } from "./browser.js";
+import { registerWebDataTools } from "./web-data.js";
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 
 // ---------------------------------------------------------------------------
 // Bootstrap
@@ -502,6 +504,12 @@ server.registerTool(
 );
 
 // ---------------------------------------------------------------------------
+// 7. Structured web_data_* tools (35 vertical dataset scrapers)
+// ---------------------------------------------------------------------------
+
+registerWebDataTools(server, client, cfg);
+
+// ---------------------------------------------------------------------------
 // Connect
 // ---------------------------------------------------------------------------
 
@@ -510,7 +518,8 @@ async function main() {
   await server.connect(transport);
   console.error(
     `[brightdata-mcp] v${VERSION} ready (unlocker zone="${cfg.unlockerZone}", ` +
-      `serp zone="${cfg.serpZone}", browser=${cfg.browserAuth ? "configured" : "not configured"}).`
+      `serp zone="${cfg.serpZone}", browser=${cfg.browserAuth ? "configured" : "not configured"}, ` +
+      `web_data tools=enabled).`
   );
 }
 
