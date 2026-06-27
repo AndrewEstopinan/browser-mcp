@@ -39,6 +39,7 @@ import { smartScrape, skipListSnapshot, htmlToMarkdown, detectBlock } from "./ro
 import { cacheGet, cacheSet, cachePeek, DEFAULT_CACHE_TTL_MS } from "./cache.js";
 import { extractMainContent, extractMeta, extractJsonLd, parseFeed, parseSitemap, parseRobots } from "./extract.js";
 import { smartScrapeBatch, smartCrawl } from "./crawl.js";
+import { replayHar } from "./replay.js";
 
 const VERSION = "1.1.0";
 
@@ -547,6 +548,69 @@ server.registerTool(
 
       const { allowed, matchedRule } = parseRobots(robotsTxt, path);
       return text(JSON.stringify({ url: args.url, path, allowed, matched_rule: matchedRule ?? "none (default allow)" }, null, 2));
+    } catch (e) {
+      return fail(e);
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// 0h. HAR replay with auto-correlation
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "replay_har",
+  {
+    title: "Replay a recorded browser session (HAR) with CSRF/token auto-correlation",
+    description:
+      "Replays an HTTP Archive (.har) file exported from browser DevTools. " +
+      "Automatically detects dynamic values (CSRF tokens, nonces, hidden form fields, " +
+      "JSON token fields) in responses and substitutes fresh values into subsequent " +
+      "requests — so login flows, form submissions, and signed API calls work correctly " +
+      "even though the recorded values are stale. Static assets (images, CSS, JS) are " +
+      "skipped by default. Use 'substitutions' for values that never appear in responses " +
+      "(credentials, API keys). Use 'dry_run' to preview what would be sent.",
+    inputSchema: {
+      har_path: z.string().describe("Absolute path to the exported .har file."),
+      substitutions: z
+        .record(z.string())
+        .optional()
+        .describe(
+          "Static value replacements applied to every request before sending. " +
+          "Use for credentials and anything that never appears in a response body. " +
+          "e.g. { \"recorded_password\": \"real_password\" }"
+        ),
+      skip_assets: z
+        .boolean()
+        .default(true)
+        .describe("Skip image, font, CSS, and JS requests (default true)."),
+      dry_run: z
+        .boolean()
+        .default(false)
+        .describe("Preview what would be sent without making any requests."),
+    },
+  },
+  async (args) => {
+    try {
+      const results = await replayHar(args.har_path, {
+        substitutions: args.substitutions,
+        skipAssets: args.skip_assets,
+        dryRun: args.dry_run,
+      });
+
+      const sent = results.filter((r) => !r.skipped);
+      const correlated = results.flatMap((r) => r.correlatedVars);
+      const summary = {
+        total_entries: results.length,
+        requests_sent: sent.length,
+        assets_skipped: results.filter((r) => r.skipped === "asset").length,
+        auto_correlated_vars: [...new Set(correlated)],
+      };
+
+      return ok([
+        { type: "text", text: JSON.stringify(summary, null, 2) },
+        { type: "text", text: truncate(JSON.stringify(results, null, 2)) },
+      ]);
     } catch (e) {
       return fail(e);
     }
