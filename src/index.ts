@@ -5,6 +5,14 @@
  * Exposes Bright Data's Web Access APIs as Model Context Protocol tools so an
  * AI agent can browse and extract data from any public website:
  *
+ *   smart_scrape               - cost-aware fetch: free first, Bright Data only if blocked
+ *   smart_scrape_batch         - fetch multiple URLs concurrently
+ *   smart_crawl                - follow links up to a depth/page limit
+ *   smart_diff                 - detect page changes since last fetch
+ *   smart_extract              - extract JSON-LD, OG tags, and meta from a page
+ *   parse_feed                 - parse RSS / Atom feeds and XML sitemaps
+ *   check_robots               - check robots.txt before scraping
+ *   smart_scrape_skiplist      - inspect the in-memory hard-domain skip-list
  *   unlocker_scrape            - fetch any URL (html / markdown / screenshot)
  *   unlocker_scrape_async      - start a long-running unlock job
  *   unlocker_get_async_result  - poll an async unlock job
@@ -22,11 +30,15 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-import { loadConfig } from "./config.js";
+import { loadConfig, type BrightDataConfig } from "./config.js";
 import { BrightDataClient, BrightDataApiError } from "./client.js";
 import { buildSearchUrl } from "./serp.js";
 import { runBrowserTask, type BrowserAction } from "./browser.js";
 import { registerWebDataTools } from "./web-data.js";
+import { smartScrape, skipListSnapshot, htmlToMarkdown, detectBlock } from "./router.js";
+import { cacheGet, cacheSet, cachePeek, DEFAULT_CACHE_TTL_MS } from "./cache.js";
+import { extractMainContent, extractMeta, extractJsonLd, parseFeed, parseSitemap, parseRobots } from "./extract.js";
+import { smartScrapeBatch, smartCrawl } from "./crawl.js";
 
 const VERSION = "1.1.0";
 
@@ -34,7 +46,7 @@ const VERSION = "1.1.0";
 // Bootstrap
 // ---------------------------------------------------------------------------
 
-let cfg;
+let cfg: BrightDataConfig;
 try {
   cfg = loadConfig();
 } catch (e) {
@@ -78,6 +90,470 @@ function truncate(s: string, max = 200_000): string {
 }
 
 // ---------------------------------------------------------------------------
+// 0. Smart scrape: cost-aware router (free first, Bright Data only if blocked)
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "smart_scrape",
+  {
+    title: "Scrape a URL (cost-aware: free first, Bright Data only if blocked)",
+    description:
+      "PREFERRED scraping tool. Fetches a page as cheaply as possible: it first " +
+      "tries a FREE direct HTTP request, and only falls back to the PAID Bright " +
+      "Data Web Unlocker if it detects an anti-bot wall (Cloudflare, Akamai, " +
+      "Imperva/Incapsula, PerimeterX, DataDome, a CAPTCHA, or a 403/429/503). " +
+      "An in-memory skip-list remembers hard domains so repeat calls skip the " +
+      "doomed free attempt. Most sites cost $0. The result reports which tier " +
+      "was used and whether credit was spent. Use this instead of unlocker_scrape " +
+      "for read-only fetches; reserve browser_scrape for real JS interaction.",
+    inputSchema: {
+      url: z.string().url().describe("Full target URL including https://"),
+      data_format: z
+        .enum(["html", "markdown", "content_only"])
+        .default("markdown")
+        .describe("Output format. 'content_only' strips nav/ads and returns just the main article text."),
+      country: z
+        .string()
+        .length(2)
+        .optional()
+        .describe("2-letter exit-IP country (only applies if it escalates to Bright Data)."),
+      method: z.string().default("GET").describe("HTTP method."),
+      headers: z.record(z.string()).optional().describe("Custom request headers for both tiers."),
+      wait_for_selector: z.string().optional().describe("CSS selector to wait for (Bright Data tier only)."),
+      wait_for_text: z.string().optional().describe("Text to wait for (Bright Data tier only)."),
+      force_bright_data: z
+        .boolean()
+        .default(false)
+        .describe("Skip the free attempt and go straight to the paid Unlocker."),
+      free_only: z
+        .boolean()
+        .default(false)
+        .describe("Never spend credit; return best-effort free result even if blocked."),
+      ignore_skip_list: z
+        .boolean()
+        .default(false)
+        .describe("Ignore the hard-domain skip-list and always try the free tier first."),
+      direct_timeout_ms: z
+        .number()
+        .int()
+        .default(12000)
+        .describe("Abort the free fetch after this many ms, then escalate."),
+      min_body_bytes: z
+        .number()
+        .int()
+        .default(0)
+        .describe("Treat a 2xx response smaller than this as a block (0 = off)."),
+      rate_limit_ms: z
+        .number()
+        .int()
+        .default(0)
+        .describe("Minimum ms between free-tier requests to the same domain (0 = off)."),
+      use_cache: z.boolean().default(false).describe("Return a cached response if one exists and isn't expired."),
+      cache_ttl_ms: z
+        .number()
+        .int()
+        .default(DEFAULT_CACHE_TTL_MS)
+        .describe("Cache TTL in ms (default 1 hour). Only used when use_cache=true."),
+      respect_robots: z
+        .boolean()
+        .default(false)
+        .describe("Check robots.txt before fetching. Returns an error if the path is disallowed."),
+    },
+  },
+  async (args) => {
+    try {
+      // Robots.txt check
+      if (args.respect_robots) {
+        const robotsUrl = new URL("/robots.txt", args.url).href;
+        const path = new URL(args.url).pathname;
+        let robotsTxt = cacheGet(robotsUrl, "text");
+        if (!robotsTxt) {
+          try {
+            const resp = await fetch(robotsUrl, { signal: AbortSignal.timeout(5_000) });
+            if (resp.ok) {
+              robotsTxt = await resp.text();
+              cacheSet(robotsUrl, "text", robotsTxt, 24 * 60 * 60_000);
+            }
+          } catch { /* if robots.txt unreachable, allow */ }
+        }
+        if (robotsTxt) {
+          const { allowed, matchedRule } = parseRobots(robotsTxt, path);
+          if (!allowed) return text(JSON.stringify({ blocked: true, reason: `robots.txt disallows this path`, rule: matchedRule }));
+        }
+      }
+
+      // Cache read
+      const cacheFormat = args.data_format;
+      if (args.use_cache) {
+        const cached = cacheGet(args.url, cacheFormat);
+        if (cached) return ok([
+          { type: "text", text: JSON.stringify({ cached: true, data_format: cacheFormat }) },
+          { type: "text", text: truncate(cached) },
+        ]);
+      }
+
+      const result = await smartScrape({
+        url: args.url,
+        dataFormat: args.data_format === "content_only" ? "html" : args.data_format,
+        country: args.country,
+        method: args.method,
+        headers: args.headers,
+        waitForSelector: args.wait_for_selector,
+        waitForText: args.wait_for_text,
+        forceBrightData: args.force_bright_data,
+        freeOnly: args.free_only,
+        ignoreSkipList: args.ignore_skip_list,
+        directTimeoutMs: args.direct_timeout_ms,
+        minBodyBytes: args.min_body_bytes,
+        rateLimitMs: args.rate_limit_ms,
+        client,
+        unlockerZone: cfg.unlockerZone,
+      });
+
+      let outputText = result.text ?? "";
+      if (args.data_format === "content_only") outputText = extractMainContent(outputText);
+
+      if (args.use_cache) cacheSet(args.url, cacheFormat, outputText, args.cache_ttl_ms);
+
+      const summary = {
+        tier: result.tier,
+        paid: result.paid,
+        cost: result.paid ? "Bright Data credit spent" : "FREE (no credit)",
+        skipped_free_tier: result.skippedFreeTier,
+        status: result.status,
+        final_url: result.finalUrl,
+        block_reason: result.blockReason,
+        data_format: args.data_format,
+        log: result.log,
+      };
+
+      return ok([
+        { type: "text", text: JSON.stringify(summary, null, 2) },
+        { type: "text", text: truncate(outputText) },
+      ]);
+    } catch (e) {
+      return fail(e);
+    }
+  }
+);
+
+server.registerTool(
+  "smart_scrape_skiplist",
+  {
+    title: "Inspect the cost-router skip-list",
+    description:
+      "Show the in-memory list of domains currently being sent straight to Bright " +
+      "Data (because the free tier was blocked recently). Useful for debugging cost.",
+    inputSchema: {},
+  },
+  async () => {
+    try {
+      return text(JSON.stringify(skipListSnapshot(), null, 2));
+    } catch (e) {
+      return fail(e);
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// 0b. Batch scraping
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "smart_scrape_batch",
+  {
+    title: "Scrape multiple URLs concurrently (cost-aware)",
+    description:
+      "Fetch an array of URLs in parallel using the same free-first routing as smart_scrape. " +
+      "Returns an array of {url, success, text, tier, paid} objects. Use this instead of " +
+      "calling smart_scrape in a loop — it's significantly faster.",
+    inputSchema: {
+      urls: z.array(z.string().url()).min(1).max(50).describe("URLs to fetch (max 50)."),
+      data_format: z.enum(["html", "markdown", "content_only"]).default("markdown"),
+      concurrency: z.number().int().min(1).max(10).default(5).describe("Max parallel fetches."),
+      force_bright_data: z.boolean().default(false),
+      free_only: z.boolean().default(false),
+      direct_timeout_ms: z.number().int().default(12000),
+      rate_limit_ms: z.number().int().default(0),
+    },
+  },
+  async (args) => {
+    try {
+      const results = await smartScrapeBatch(
+        args.urls,
+        {
+          dataFormat: args.data_format === "content_only" ? "html" : args.data_format,
+          forceBrightData: args.force_bright_data,
+          freeOnly: args.free_only,
+          directTimeoutMs: args.direct_timeout_ms,
+          rateLimitMs: args.rate_limit_ms,
+          client,
+          unlockerZone: cfg.unlockerZone,
+        },
+        args.concurrency
+      );
+
+      if (args.data_format === "content_only") {
+        for (const r of results) {
+          if (r.success && r.text) r.text = extractMainContent(r.text);
+        }
+      }
+
+      const paid = results.filter((r) => r.paid).length;
+      const failed = results.filter((r) => !r.success).length;
+      const summary = { total: results.length, paid, free: results.length - paid - failed, failed };
+      return ok([
+        { type: "text", text: JSON.stringify(summary, null, 2) },
+        { type: "text", text: truncate(JSON.stringify(results, null, 2)) },
+      ]);
+    } catch (e) {
+      return fail(e);
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// 0c. Crawl with link following
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "smart_crawl",
+  {
+    title: "Crawl a site by following links",
+    description:
+      "Start at a URL, follow links up to a depth/page limit, and return content from each page. " +
+      "Stays on the same hostname by default. Use url_filter to restrict which paths are visited.",
+    inputSchema: {
+      start_url: z.string().url().describe("Starting URL."),
+      max_pages: z.number().int().min(1).max(50).default(10).describe("Maximum pages to fetch."),
+      max_depth: z.number().int().min(0).max(5).default(2).describe("Maximum link depth from start."),
+      url_filter: z.string().optional().describe("Regex pattern — only follow links that match."),
+      same_host_only: z.boolean().default(true).describe("Restrict crawl to the starting hostname."),
+      data_format: z.enum(["html", "markdown"]).default("markdown"),
+      force_bright_data: z.boolean().default(false),
+      free_only: z.boolean().default(false),
+      rate_limit_ms: z.number().int().default(500).describe("ms between requests to same domain (default 500 for crawls)."),
+    },
+  },
+  async (args) => {
+    try {
+      const results = await smartCrawl(
+        args.start_url,
+        {
+          dataFormat: args.data_format,
+          forceBrightData: args.force_bright_data,
+          freeOnly: args.free_only,
+          rateLimitMs: args.rate_limit_ms,
+          client,
+          unlockerZone: cfg.unlockerZone,
+        },
+        { maxPages: args.max_pages, maxDepth: args.max_depth, urlFilter: args.url_filter, sameHostOnly: args.same_host_only }
+      );
+
+      const paid = results.filter((r) => r.paid).length;
+      const summary = { pages_fetched: results.length, paid, free: results.length - paid };
+      return ok([
+        { type: "text", text: JSON.stringify(summary, null, 2) },
+        { type: "text", text: truncate(JSON.stringify(results.map((r) => ({ url: r.url, depth: r.depth, tier: r.tier, paid: r.paid, links_found: r.linksFound, text: r.text.slice(0, 2000) })), null, 2)) },
+      ]);
+    } catch (e) {
+      return fail(e);
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// 0d. Page change detection
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "smart_diff",
+  {
+    title: "Detect changes on a page since last fetch",
+    description:
+      "Fetch a URL and compare it to the previously cached version. Returns whether the page " +
+      "changed, when it was last seen, and both versions so you can inspect what's different. " +
+      "First call always stores a baseline; subsequent calls detect changes.",
+    inputSchema: {
+      url: z.string().url(),
+      data_format: z.enum(["html", "markdown", "content_only"]).default("markdown"),
+      force_bright_data: z.boolean().default(false),
+      free_only: z.boolean().default(false),
+    },
+  },
+  async (args) => {
+    try {
+      const previous = cachePeek(args.url, args.data_format);
+
+      const result = await smartScrape({
+        url: args.url,
+        dataFormat: args.data_format === "content_only" ? "html" : args.data_format,
+        forceBrightData: args.force_bright_data,
+        freeOnly: args.free_only,
+        client,
+        unlockerZone: cfg.unlockerZone,
+      });
+
+      let current = result.text ?? "";
+      if (args.data_format === "content_only") current = extractMainContent(current);
+
+      cacheSet(args.url, args.data_format, current, 365 * 24 * 60 * 60_000); // keep indefinitely
+
+      const changed = !previous || previous.body !== current;
+      const summary = {
+        changed,
+        previous_fetched_at: previous ? new Date(previous.cachedAt).toISOString() : null,
+        tier: result.tier,
+        paid: result.paid,
+      };
+
+      return ok([
+        { type: "text", text: JSON.stringify(summary, null, 2) },
+        ...(previous && changed
+          ? [
+              { type: "text" as const, text: `--- PREVIOUS (${new Date(previous.cachedAt).toISOString()}) ---\n${truncate(previous.body, 50_000)}` },
+              { type: "text" as const, text: `--- CURRENT ---\n${truncate(current, 50_000)}` },
+            ]
+          : [{ type: "text" as const, text: truncate(current) }]),
+      ]);
+    } catch (e) {
+      return fail(e);
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// 0e. Structured metadata extraction
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "smart_extract",
+  {
+    title: "Extract structured metadata from a page",
+    description:
+      "Fetch a page and extract structured data: JSON-LD schema.org objects, Open Graph tags, " +
+      "Twitter card meta, standard meta description/keywords, and page title. Returns clean JSON. " +
+      "Useful for getting product info, article metadata, or any schema.org markup without parsing HTML.",
+    inputSchema: {
+      url: z.string().url(),
+      force_bright_data: z.boolean().default(false),
+      free_only: z.boolean().default(false),
+      use_cache: z.boolean().default(true).describe("Use cached HTML if available (default true)."),
+    },
+  },
+  async (args) => {
+    try {
+      let html: string;
+      const cached = args.use_cache ? cacheGet(args.url, "html") : null;
+      if (cached) {
+        html = cached;
+      } else {
+        const result = await smartScrape({
+          url: args.url,
+          dataFormat: "html",
+          forceBrightData: args.force_bright_data,
+          freeOnly: args.free_only,
+          client,
+          unlockerZone: cfg.unlockerZone,
+        });
+        html = result.text ?? "";
+        if (html) cacheSet(args.url, "html", html);
+      }
+
+      const extracted = {
+        meta: extractMeta(html),
+        json_ld: extractJsonLd(html),
+      };
+
+      return text(JSON.stringify(extracted, null, 2));
+    } catch (e) {
+      return fail(e);
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// 0f. Feed and sitemap parsing
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "parse_feed",
+  {
+    title: "Parse an RSS feed, Atom feed, or XML sitemap",
+    description:
+      "Fetch and parse an RSS 2.0 feed, Atom 1.0 feed, or XML sitemap. Auto-detects the format " +
+      "from content-type and content. Returns structured JSON with items/entries or sitemap URLs. " +
+      "Free direct fetch — no Bright Data credit unless the feed is behind a wall.",
+    inputSchema: {
+      url: z.string().url().describe("URL of the feed or sitemap."),
+      free_only: z.boolean().default(true),
+    },
+  },
+  async (args) => {
+    try {
+      const result = await smartScrape({
+        url: args.url,
+        dataFormat: "html",
+        freeOnly: args.free_only,
+        client,
+        unlockerZone: cfg.unlockerZone,
+      });
+
+      const raw = result.text ?? "";
+      const isSitemap = /<(?:urlset|sitemapindex)[^>]*>/i.test(raw);
+      const isFeed = /<(?:rss|feed|channel)[^>]*>/i.test(raw);
+
+      if (isSitemap) {
+        return text(JSON.stringify({ type: "sitemap", entries: parseSitemap(raw) }, null, 2));
+      }
+      if (isFeed) {
+        return text(JSON.stringify(parseFeed(raw), null, 2));
+      }
+      return text(JSON.stringify({ type: "unknown", raw: raw.slice(0, 500) }));
+    } catch (e) {
+      return fail(e);
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// 0g. robots.txt compliance check
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "check_robots",
+  {
+    title: "Check if a URL is allowed by robots.txt",
+    description:
+      "Fetch and parse the site's robots.txt, then check whether the given URL path is " +
+      "permitted for the wildcard (*) user-agent. Returns the verdict and the matching rule. " +
+      "robots.txt is cached for 24 hours.",
+    inputSchema: {
+      url: z.string().url().describe("The URL you want to check (not the robots.txt URL itself)."),
+    },
+  },
+  async (args) => {
+    try {
+      const robotsUrl = new URL("/robots.txt", args.url).href;
+      const path = new URL(args.url).pathname;
+
+      let robotsTxt = cacheGet(robotsUrl, "text");
+      if (!robotsTxt) {
+        const resp = await fetch(robotsUrl, { signal: AbortSignal.timeout(8_000) });
+        if (!resp.ok) return text(JSON.stringify({ allowed: true, reason: `robots.txt returned HTTP ${resp.status} — assuming allowed` }));
+        robotsTxt = await resp.text();
+        cacheSet(robotsUrl, "text", robotsTxt, 24 * 60 * 60_000);
+      }
+
+      const { allowed, matchedRule } = parseRobots(robotsTxt, path);
+      return text(JSON.stringify({ url: args.url, path, allowed, matched_rule: matchedRule ?? "none (default allow)" }, null, 2));
+    } catch (e) {
+      return fail(e);
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
 // 1. Unlocker: fetch any URL
 // ---------------------------------------------------------------------------
 
@@ -86,11 +562,11 @@ server.registerTool(
   {
     title: "Scrape any URL (Web Unlocker)",
     description:
-      "Fetch any public web page through Bright Data's Web Unlocker, which " +
-      "automatically rotates proxies, manages fingerprints, and solves CAPTCHAs. " +
-      "Returns the page as raw HTML, clean Markdown (great for LLMs), or a PNG " +
-      "screenshot. Use this for most read-only scraping; use browser_scrape only " +
-      "when you need clicks/scrolling/JS interaction.",
+      "Always spends Bright Data credit. For read-only fetches prefer smart_scrape — " +
+      "it tries a free direct request first and only falls back here when the site " +
+      "actively blocks it. Use unlocker_scrape directly only when you need screenshot " +
+      "output, want to force Bright Data unconditionally, or smart_scrape has already " +
+      "confirmed the site is hard-blocked.",
     inputSchema: {
       url: z.string().url().describe("Full target URL including https://"),
       data_format: z
@@ -261,10 +737,12 @@ server.registerTool(
 server.registerTool(
   "serp_search",
   {
-    title: "Search engine results (SERP API)",
+    title: "Search engine results (free DDG or paid SERP API)",
     description:
-      "Run a search on Google, Bing, Yandex, or DuckDuckGo and get structured, " +
-      "parsed JSON results (organic, ads, knowledge, etc.) via Bright Data's SERP API.",
+      "Run a web search. For DuckDuckGo queries, tries a FREE direct fetch first " +
+      "and only falls back to the paid Bright Data SERP API if blocked. For Google, " +
+      "Bing, and Yandex, always uses the paid SERP API (no free public API exists). " +
+      "Returns structured JSON (parse=true) or raw HTML/Markdown (parse=false).",
     inputSchema: {
       query: z.string().describe("The search query."),
       engine: z
@@ -288,6 +766,24 @@ server.registerTool(
   },
   async (args) => {
     try {
+      // Free tier: DuckDuckGo lite endpoint (no API key, no credit).
+      if (args.engine === "duckduckgo" && !args.parse) {
+        const ddgUrl =
+          `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(args.query)}` +
+          (args.page > 1 ? `&s=${(args.page - 1) * 25}` : "");
+        try {
+          const resp = await fetch(ddgUrl, {
+            headers: { "User-Agent": "Mozilla/5.0 (compatible; bot/1.0)" },
+            signal: AbortSignal.timeout(10_000),
+          });
+          if (resp.ok) {
+            const html = await resp.text();
+            const block = detectBlock({ status: resp.status, headers: resp.headers, body: html, minBodyBytes: 500 });
+            if (!block) return text(truncate(htmlToMarkdown(html)));
+          }
+        } catch { /* fall through to Bright Data */ }
+      }
+
       const url = buildSearchUrl({
         engine: args.engine,
         query: args.query,
@@ -517,9 +1013,9 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error(
-    `[brightdata-mcp] v${VERSION} ready (unlocker zone="${cfg.unlockerZone}", ` +
-      `serp zone="${cfg.serpZone}", browser=${cfg.browserAuth ? "configured" : "not configured"}, ` +
-      `web_data tools=enabled).`
+    `[brightdata-mcp] v${VERSION} ready — ` +
+      `bright_data=${cfg.apiKey ? `configured (unlocker="${cfg.unlockerZone}", serp="${cfg.serpZone}")` : "NOT configured (free-tier tools only)"}, ` +
+      `browser=${cfg.browserAuth ? "configured" : "not configured"}.`
   );
 }
 

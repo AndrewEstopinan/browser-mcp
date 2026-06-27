@@ -209,9 +209,7 @@ export async function runBrowserTask(
           }
           break;
         case "scroll":
-          await page.evaluate(() => {
-            window.scrollTo(0, document.body.scrollHeight);
-          });
+          await page.evaluate("window.scrollTo(0, document.body.scrollHeight)");
           log.push("scroll to bottom");
           break;
         case "solve_captcha": {
@@ -255,7 +253,7 @@ export async function runBrowserTask(
       result.html = await page.content();
     }
     if (input.returnText) {
-      result.text = await page.evaluate(() => document.body?.innerText ?? "");
+      result.text = await page.evaluate("document.body?.innerText ?? ''") as string;
     }
     if (input.screenshot) {
       const buf = (await page.screenshot({

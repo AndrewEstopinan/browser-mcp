@@ -20,7 +20,7 @@
  */
 
 export interface BrightDataConfig {
-  apiKey: string;
+  apiKey?: string;
   unlockerZone: string;
   serpZone: string;
   browserAuth?: string;
@@ -38,12 +38,6 @@ function readEnv(name: string): string | undefined {
 
 export function loadConfig(): BrightDataConfig {
   const apiKey = readEnv("BRIGHTDATA_API_KEY");
-  if (!apiKey) {
-    throw new Error(
-      "Missing BRIGHTDATA_API_KEY. Set it to your Bright Data API token " +
-        "(https://brightdata.com/cp/setting/users) before starting the server."
-    );
-  }
 
   return {
     apiKey,

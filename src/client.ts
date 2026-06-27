@@ -71,6 +71,12 @@ export class BrightDataClient {
   }
 
   private authHeaders(extra?: Record<string, string>): Record<string, string> {
+    if (!this.cfg.apiKey) {
+      throw new Error(
+        "BRIGHTDATA_API_KEY is not set. This tool requires a paid Bright Data account. " +
+          "Set the env var and restart, or use smart_scrape for free direct fetching."
+      );
+    }
     return {
       Authorization: `Bearer ${this.cfg.apiKey}`,
       "Content-Type": "application/json",
