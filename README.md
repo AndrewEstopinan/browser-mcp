@@ -1,160 +1,175 @@
-# Bright Data MCP Server
+﻿# Scout MCP
 
-A full-featured [Model Context Protocol](https://modelcontextprotocol.io) (MCP)
-server that lets an AI agent **browse and extract data from any public website**
-through [Bright Data's Web Access APIs](https://docs.brightdata.com/scraping-automation/introduction).
+**Free-first web access for AI agents. Bright Data only when a site actually blocks you.**
 
-All heavy lifting — proxy rotation, browser fingerprinting, CAPTCHA solving, and
-JavaScript rendering — happens **on Bright Data's cloud infrastructure**, so this
-server runs fine on machines that can't (or shouldn't) run a browser locally. The
-Browser API tool uses `puppeteer-core`, which speaks CDP to a remote browser and
-**never downloads or launches Chromium on your machine**.
+Scout is a [Model Context Protocol](https://modelcontextprotocol.io) server that gives your AI agent a full browser and scraping toolkit. Most pages are fetched for free with a plain HTTP request. The paid [Bright Data](https://brightdata.com) tier only kicks in when an anti-bot wall (Cloudflare, Akamai, CAPTCHA, etc.) is detected — which means most research workflows cost nothing.
+
+**No API key required to get started.** Free tools work out of the box. Configure Bright Data only when you need it.
+
+---
+
+## How routing works
+
+Every fetch follows a cost ladder and stops at the first rung that works:
+
+```
+1. Free direct fetch  →  realistic browser headers, no cost
+2. Bright Data        →  paid proxy + unlocker, only on detected block
+```
+
+An in-memory **skip-list** (persisted to disk) remembers which domains blocked the free tier so repeat calls go straight to Bright Data — no wasted attempt. Skip-list entries expire after 30 minutes so the server re-probes in case a site drops its protection.
+
+---
 
 ## Tools
 
-| Tool | What it does |
-| --- | --- |
-| `unlocker_scrape` | Fetch any URL as HTML, clean Markdown, or a PNG screenshot. Auto-handles blocking & CAPTCHAs. |
-| `unlocker_scrape_async` | Start a long-running unlock job; returns a `response_id`. |
-| `unlocker_get_async_result` | Poll/fetch the result of an async unlock job. |
-| `unlocker_success_rate` | Per-domain success-rate stats (last 7 days). |
-| `serp_search` | Structured search results from Google / Bing / Yandex / DuckDuckGo. |
-| `web_scraper_trigger` | Trigger a Crawl / Web Scraper dataset job over one or more URLs. |
-| `web_scraper_get_results` | Check progress and download dataset results by `snapshot_id`. |
-| `browser_scrape` | Drive a real cloud browser: navigate, click, type, scroll, run JS, auto-solve CAPTCHAs, emulate devices, block ads, return rendered HTML / text / screenshot. |
+### Smart (cost-aware) tools
 
-## Prerequisites
+| Tool | Description |
+|------|-------------|
+| `smart_scrape` | **Start here.** Free-first fetch with automatic Bright Data fallback. Supports `content_only` format (main article text, strips ads/nav), disk caching, robots.txt checking, per-domain rate limiting, and PDF auto-escalation. |
+| `smart_scrape_batch` | Fetch up to 50 URLs in parallel with the same free-first routing. Returns a cost summary. Much faster than looping `smart_scrape`. |
+| `smart_crawl` | Start at a URL and follow links up to a configurable depth and page limit. Stays on the same host by default; accepts a URL regex filter. |
+| `smart_diff` | Fetch a page and compare it to the last cached version. Stores a baseline on first call; detects changes on every subsequent call. |
+| `smart_extract` | Extract structured metadata from a page: JSON-LD schema.org objects, Open Graph tags, Twitter card meta, and standard meta tags. Returns clean JSON. |
+| `parse_feed` | Fetch and parse an RSS 2.0 feed, Atom 1.0 feed, or XML sitemap. Returns structured JSON — no HTML parsing needed. |
+| `check_robots` | Check whether a URL is permitted by the site's `robots.txt`. Result is cached for 24 hours. |
+| `smart_scrape_skiplist` | Dump the current skip-list of hard-blocked domains for cost debugging. |
+| `serp_search` | Web search. DuckDuckGo queries try a free direct fetch first. Google, Bing, and Yandex always use the paid Bright Data SERP API. |
 
-1. A [Bright Data account](https://brightdata.com) and an **API token**
-   (Account settings → API tokens, or <https://brightdata.com/cp/setting/users>).
-2. One or more **zones** created under **Web Access APIs** in the control panel:
-   - a **Web Unlocker** zone (for `unlocker_*` and `serp_search`)
-   - a **SERP API** zone (for `serp_search`)
-   - a **Browser API** zone (for `browser_scrape`) — copy its `USER:PASS` from the
-     zone's *Overview* tab
-   - a **Dataset id** (`gd_...`) from <https://brightdata.com/cp/datasets> for the
-     Crawl / Web Scraper tools
-3. Node.js **18 or newer**.
+### Bright Data tools (always paid)
 
-> Bright Data's free tier includes monthly credits; adding a payment method
-> unlocks API access and grants a small verification credit. Usage of all of
-> these APIs is billed by Bright Data per their pricing.
+| Tool | Description |
+|------|-------------|
+| `unlocker_scrape` | Force a fetch through Bright Data's Web Unlocker. Use when you specifically need a screenshot, or when `smart_scrape` has already confirmed a site is hard-blocked. |
+| `unlocker_scrape_async` | Start a long-running unlock job. Returns a `response_id`. |
+| `unlocker_get_async_result` | Poll for and retrieve the result of an async unlock job. |
+| `unlocker_success_rate` | Per-domain success-rate statistics from the last 7 days. |
+| `web_scraper_trigger` | Trigger a Bright Data dataset / Web Scraper crawl job over one or more URLs. |
+| `web_scraper_get_results` | Check progress and download results for a crawl job by `snapshot_id`. |
+| `browser_scrape` | Drive a real remote cloud browser: navigate, click, type, scroll, run JS, auto-solve CAPTCHAs, emulate devices, block ads, return rendered HTML / text / screenshot. Requires `BRIGHTDATA_BROWSER_AUTH`. |
+| `web_data_*` (35 tools) | Pre-built structured scrapers for Amazon, LinkedIn, Google Maps, Instagram, Reddit, and more. Returns clean JSON — no setup. |
 
-## Install & build
+---
+
+## Quickstart
 
 ```bash
-npm install
-npm run build
+git clone https://github.com/AndrewEstopinan/browser-mcp
+cd browser-mcp
+npm install && npm run build
+node dist/index.js   # works immediately — no API key needed for free tools
 ```
 
-## Configure
-
-Copy `.env.example` to `.env` and fill in your values:
+To unlock paid tools, set `BRIGHTDATA_API_KEY`:
 
 ```bash
-cp .env.example .env
-```
-
-| Variable | Required | Default | Notes |
-| --- | --- | --- | --- |
-| `BRIGHTDATA_API_KEY` | yes | — | Bearer token for all REST calls. |
-| `BRIGHTDATA_UNLOCKER_ZONE` | no | `web_unlocker1` | Web Unlocker zone name. |
-| `BRIGHTDATA_SERP_ZONE` | no | `serp_api1` | SERP API zone name. |
-| `BRIGHTDATA_BROWSER_AUTH` | for `browser_scrape` | — | `USER:PASS` of the Browser API zone. |
-| `BRIGHTDATA_BROWSER_HOST` | no | `brd.superproxy.io:9222` | CDP host:port. |
-| `BRIGHTDATA_DATASET_ID` | for crawl tools | — | Default dataset id (`gd_...`). |
-| `BRIGHTDATA_API_BASE_URL` | no | `https://api.brightdata.com` | Override base URL. |
-
-The server reads variables from the real process environment. If you keep them in
-`.env`, load it before launching (e.g. `node --env-file=.env dist/index.js` on
-Node 20+, or via your MCP client's `env` block below).
-
-## Run
-
-```bash
-# Node 20+ can load the .env file directly:
 node --env-file=.env dist/index.js
-
-# or rely on environment variables already exported in your shell:
-npm start
 ```
 
-## Use it from an MCP client
+---
 
-Add this to your client's MCP config (Claude Desktop, Cursor, etc.). Pass secrets
-through the `env` block rather than committing them:
+## Configuration
+
+Copy `.env.example` to `.env` and fill in what you need.
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `BRIGHTDATA_API_KEY` | No | — | Enables paid tools. Free tools work without it. |
+| `BRIGHTDATA_UNLOCKER_ZONE` | No | `web_unlocker1` | Web Unlocker zone name. |
+| `BRIGHTDATA_SERP_ZONE` | No | `serp_api1` | SERP API zone name. |
+| `BRIGHTDATA_BROWSER_AUTH` | For `browser_scrape` | — | `USER:PASS` from the Browser API zone. |
+| `BRIGHTDATA_BROWSER_HOST` | No | `brd.superproxy.io:9222` | CDP host. |
+| `BRIGHTDATA_DATASET_ID` | For crawl tools | — | Default dataset id (`gd_...`). |
+| `BRIGHTDATA_API_BASE_URL` | No | `https://api.brightdata.com` | Override API base. |
+| `SMART_SKIP_THRESHOLD` | No | `1` | Blocks before a domain is skip-listed. |
+| `SMART_SKIP_TTL_MS` | No | `1800000` | Skip-list entry lifetime in ms (30 min). |
+| `SMART_SKIP_FILE` | No | `./smart_skip_list.json` | Persisted skip-list path. |
+| `SMART_CACHE_DIR` | No | `./smart_cache` | Response cache directory. |
+| `SMART_CACHE_TTL_MS` | No | `3600000` | Default cache TTL in ms (1 hour). |
+
+---
+
+## Add to your MCP client
+
+Add this to your Claude Desktop, Cursor, or other MCP client config:
 
 ```json
 {
   "mcpServers": {
-    "brightdata": {
+    "scout": {
       "command": "node",
-      "args": ["/absolute/path/to/brightdata-mcp/dist/index.js"],
+      "args": ["/absolute/path/to/browser-mcp/dist/index.js"],
       "env": {
         "BRIGHTDATA_API_KEY": "your_api_key_here",
         "BRIGHTDATA_UNLOCKER_ZONE": "web_unlocker1",
         "BRIGHTDATA_SERP_ZONE": "serp_api1",
-        "BRIGHTDATA_BROWSER_AUTH": "brd-customer-XXXX-zone-YYYY:zzzz",
-        "BRIGHTDATA_DATASET_ID": "gd_xxxxxxxx"
+        "BRIGHTDATA_BROWSER_AUTH": "brd-customer-XXXX-zone-YYYY:zzzz"
       }
     }
   }
 }
 ```
 
-## Example tool calls
+For free-only use, omit the `env` block entirely.
 
-Fetch a page as Markdown:
+---
 
+## Example calls
+
+**Fetch an article (content only, no nav/ads):**
 ```json
-{ "tool": "unlocker_scrape", "arguments": { "url": "https://example.com", "data_format": "markdown" } }
+{ "tool": "smart_scrape", "arguments": { "url": "https://example.com/article", "data_format": "content_only" } }
 ```
 
-Search Google:
-
+**Fetch 10 URLs in parallel:**
 ```json
-{ "tool": "serp_search", "arguments": { "query": "best laptops 2026", "engine": "google", "num": 20 } }
+{ "tool": "smart_scrape_batch", "arguments": { "urls": ["https://a.com", "https://b.com"], "concurrency": 5 } }
 ```
 
-Drive a cloud browser through a CAPTCHA and screenshot it:
+**Crawl a docs site up to 20 pages:**
+```json
+{ "tool": "smart_crawl", "arguments": { "start_url": "https://docs.example.com", "max_pages": 20, "max_depth": 3 } }
+```
 
+**Check if a page changed since last time:**
+```json
+{ "tool": "smart_diff", "arguments": { "url": "https://example.com/pricing" } }
+```
+
+**Extract JSON-LD and Open Graph metadata:**
+```json
+{ "tool": "smart_extract", "arguments": { "url": "https://example.com/product/123" } }
+```
+
+**Parse an RSS feed:**
+```json
+{ "tool": "parse_feed", "arguments": { "url": "https://example.com/feed.xml" } }
+```
+
+**Drive a cloud browser through a CAPTCHA:**
 ```json
 {
   "tool": "browser_scrape",
   "arguments": {
-    "url": "https://site-with-captcha.example",
+    "url": "https://hard-site.example",
     "solve_captcha": true,
     "screenshot": true,
     "actions": [
       { "type": "wait_for_selector", "selector": "#results" },
-      { "type": "click", "selector": "button.load-more" },
-      { "type": "scroll" }
+      { "type": "click", "selector": "button.load-more" }
     ]
   }
 }
 ```
 
-## How it maps to the Bright Data docs
-
-- **Unlocker / SERP** → `POST https://api.brightdata.com/request`
-  with `{ zone, url, format, method, country, data_format }`.
-  Async adds `?async=true` and is retrieved via `GET /unblocker/get_result`.
-- **Crawl / Web Scraper** → `POST /datasets/v3/trigger?dataset_id=...`,
-  polled via `GET /datasets/v3/progress/{id}` and downloaded via
-  `GET /datasets/v3/snapshot/{id}`.
-- **Browser API** → `puppeteer.connect({ browserWSEndpoint: "wss://USER:PASS@brd.superproxy.io:9222" })`
-  plus Bright Data's custom CDP commands: `Captcha.solve`, `Captcha.setAutoSolve`,
-  `Unblocker.enableAdBlock`, `Proxy.useSession`, `Emulation.setDevice`,
-  `Browser.getSessionId`.
+---
 
 ## Responsible use
 
-This server accesses **public** web data through a paid, compliant commercial
-service. Respect each target site's Terms of Service and `robots.txt`, applicable
-laws (e.g. data-protection rules), and Bright Data's
-[Acceptable Use Policy](https://brightdata.com/acceptable-use-policy). Don't use it
-to access content behind logins/authentication you aren't authorized to use, or to
-collect personal data without a lawful basis.
+Scout accesses public web data through a paid, compliant commercial service. Respect each target site's Terms of Service and `robots.txt` (use the built-in `check_robots` tool), applicable laws, and Bright Data's [Acceptable Use Policy](https://brightdata.com/acceptable-use-policy). Don't use it to access content behind logins you aren't authorized to use, or to collect personal data without a lawful basis.
+
+---
 
 ## License
 
